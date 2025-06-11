@@ -1,7 +1,7 @@
 {
   "name": "sitewise-mcp-server",
-  "version": "1.0.4",
-  "description": "MCP Server for AWS IoT SiteWise integration",
+  "version": "1.0.6",
+  "description": "MCP Server for AWS IoT SiteWise integration with support for direct AWS credentials",
   "main": "index.js",
   "bin": {
     "sitewise-mcp-server": "./bin/sitewise-mcp-server.js"
@@ -18,7 +18,9 @@
     "iot-sitewise",
     "server",
     "model-context-protocol",
-    "claude"
+    "claude",
+    "credentials",
+    "aws-access-key"
   ],
   "author": "Your Name",
   "license": "MIT",

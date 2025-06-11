@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 import boto3
-import exceptiongroup 
+import exceptiongroup
 from botocore.exceptions import ClientError, NoCredentialsError
 from mcp.server.fastmcp import FastMCP
 
@@ -27,23 +27,58 @@ def debug_print(*args, **kwargs):
 # Crear el servidor MCP
 mcp = FastMCP("sitewise-mcp-server")
 
+# Función para configurar credenciales AWS
+def configure_aws_credentials():
+    """Configura las credenciales de AWS desde variables de entorno"""
+    aws_config = {}
+    
+    # Región
+    region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
+    aws_config['region_name'] = region
+    
+    # Credenciales desde .env
+    access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    session_token = os.getenv('AWS_SESSION_TOKEN')  # Para roles temporales
+    
+    if access_key and secret_key:
+        aws_config['aws_access_key_id'] = access_key
+        aws_config['aws_secret_access_key'] = secret_key
+        logger.info("Usando credenciales AWS desde variables de entorno")
+        
+        if session_token:
+            aws_config['aws_session_token'] = session_token
+            logger.info("Incluyendo session token")
+    else:
+        logger.info("Usando credenciales AWS por defecto (profile, IAM role, etc.)")
+    
+    return aws_config
+
 # Inicializar cliente SiteWise
 sitewise = None
 try:
-    # Verificar credenciales
-    sts = boto3.client('sts')
+    # Configurar credenciales
+    aws_config = configure_aws_credentials()
+    
+    # Verificar credenciales con STS
+    sts = boto3.client('sts', **aws_config)
     identity = sts.get_caller_identity()
     logger.info(f"AWS Identity: {identity.get('Arn', 'Unknown')}")
+    logger.info(f"Account: {identity.get('Account', 'Unknown')}")
+    logger.info(f"Region: {aws_config.get('region_name', 'default')}")
     
-    sitewise = boto3.client('iotsitewise')
-    logger.info("Cliente SiteWise inicializado")
+    # Crear cliente SiteWise
+    sitewise = boto3.client('iotsitewise', **aws_config)
+    logger.info("Cliente SiteWise inicializado correctamente")
     
 except NoCredentialsError:
-    logger.error("Credenciales AWS no configuradas")
+    logger.error("❌ Credenciales AWS no configuradas")
+    logger.error("💡 Configura AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY en .env")
 except ClientError as e:
-    logger.error(f"Error AWS: {e.response['Error']['Message']}")
+    logger.error(f"❌ Error AWS: {e.response['Error']['Message']}")
+    logger.error("💡 Verifica que las credenciales sean válidas y tengan permisos para SiteWise")
 except Exception as e:
-    logger.error(f"Error inicializando SiteWise: {str(e)}")
+    logger.error(f"❌ Error inicializando SiteWise: {str(e)}")
 
 @mcp.tool()
 def health_check() -> Dict[str, Any]:
@@ -55,28 +90,37 @@ def health_check() -> Dict[str, Any]:
     """
     result = {
         "server": "sitewise-mcp-server",
-        "version": "1.0.1",
+        "version": "1.0.5",
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "services": {}
+        "services": {},
+        "aws_config": {
+            "region": os.getenv('AWS_REGION', 'us-east-1'),
+            "using_env_credentials": bool(os.getenv('AWS_ACCESS_KEY_ID')),
+            "profile": os.getenv('AWS_PROFILE', 'default')
+        }
     }
     
     if sitewise:
         try:
+            # Test simple con SiteWise
             response = sitewise.list_asset_models(maxResults=1)
             result["services"]["sitewise"] = {
                 "status": "connected",
-                "region": boto3.Session().region_name or "default"
+                "region": boto3.Session().region_name or os.getenv('AWS_REGION', 'default'),
+                "test_response": "✅ Conexión exitosa"
             }
         except Exception as e:
             result["services"]["sitewise"] = {
                 "status": "error",
-                "error": str(e)
+                "error": str(e),
+                "suggestion": "Verifica permisos IoT SiteWise en tu cuenta AWS"
             }
     else:
         result["services"]["sitewise"] = {
             "status": "not_initialized",
-            "error": "Cliente no disponible - verificar credenciales AWS"
+            "error": "Cliente no disponible",
+            "suggestion": "Configura AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY en .env"
         }
     
     return result
@@ -92,7 +136,7 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
     if not sitewise:
         return {
             "success": False,
-            "error": "Cliente SiteWise no disponible. Verificar credenciales AWS."
+            "error": "Cliente SiteWise no disponible. Configurar credenciales AWS en .env"
         }
     
     try:
@@ -496,16 +540,16 @@ def get_latest_values(
 # Función principal sin logs a stdout
 if __name__ == '__main__':
     try:
-        logger.info("Iniciando servidor MCP SiteWise")
+        logger.info("🚀 Iniciando servidor MCP SiteWise")
         if sitewise:
-            logger.info("Servidor listo para conexiones MCP")
+            logger.info("✅ Servidor listo para conexiones MCP")
         else:
-            logger.warning("Servidor sin conexión SiteWise")
+            logger.warning("⚠️  Servidor sin conexión SiteWise - verificar credenciales")
         
         # Solo ejecutar MCP, sin otros prints
         mcp.run()
     except KeyboardInterrupt:
-        logger.info("Servidor detenido por usuario")
+        logger.info("🛑 Servidor detenido por usuario")
     except Exception as e:
-        logger.error(f"Error ejecutando servidor: {e}")
+        logger.error(f"❌ Error ejecutando servidor: {e}")
         sys.exit(1)
