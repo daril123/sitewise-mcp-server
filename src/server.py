@@ -1,20 +1,21 @@
-from mcp.server.fastmcp import FastMCP
+#!/usr/bin/env python3
 
+import sys
 import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-import dateutil
 import boto3
 
 from botocore.exceptions import ClientError
+from mcp.server.fastmcp import FastMCP
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Crear el servidor MCP
-mcp = FastMCP()
+mcp = FastMCP("sitewise-mcp-server")
 
 # Inicializar cliente SiteWise
 try:
@@ -23,8 +24,6 @@ try:
 except Exception as e:
     logger.error(f"Error inicializando cliente SiteWise: {str(e)}")
     sitewise = None
-
-
 
 @mcp.tool()
 def list_all_assets_hierarchy() -> Dict[str, Any]:
@@ -73,10 +72,7 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
         # 1. Identificar activos principales (sin padre)
         main_assets = [a for a in all_assets if not a['parent_id']]
         
-        # 2. Crear diccionario para búsqueda rápida
-        assets_dict = {a['id']: a for a in all_assets}
-        
-        # 3. Calcular niveles y organizar hijos
+        # 2. Calcular niveles y organizar hijos
         def calculate_levels(asset_list, level=0):
             for asset in asset_list:
                 asset['level'] = level
@@ -378,6 +374,13 @@ def get_latest_values(
         raise Exception(f"Error obteniendo últimos valores: {str(e)}")
 
 
-
+# Función principal simple que funciona con FastMCP
 if __name__ == '__main__':
-    mcp.run()
+    try:
+        logger.info("Iniciando servidor MCP SiteWise...")
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("Servidor detenido por el usuario")
+    except Exception as e:
+        logger.error(f"Error ejecutando servidor: {e}")
+        sys.exit(1)
