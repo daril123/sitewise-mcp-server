@@ -3,99 +3,164 @@
 import sys
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 import boto3
-
-from botocore.exceptions import ClientError
+import exceptiongroup
+from botocore.exceptions import ClientError, NoCredentialsError
 from mcp.server.fastmcp import FastMCP
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
+# CRÍTICO: Configurar logging solo a stderr para MCP
+logging.basicConfig(
+    level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO')),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr,  # SOLO stderr
+    force=True
+)
 logger = logging.getLogger(__name__)
+
+# Asegurar que todos los prints vayan a stderr
+def debug_print(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 # Crear el servidor MCP
 mcp = FastMCP("sitewise-mcp-server")
 
 # Inicializar cliente SiteWise
+sitewise = None
 try:
+    # Verificar credenciales
+    sts = boto3.client('sts')
+    identity = sts.get_caller_identity()
+    logger.info(f"AWS Identity: {identity.get('Arn', 'Unknown')}")
+    
     sitewise = boto3.client('iotsitewise')
-    logger.info("Cliente SiteWise inicializado correctamente")
+    logger.info("Cliente SiteWise inicializado")
+    
+except NoCredentialsError:
+    logger.error("Credenciales AWS no configuradas")
+except ClientError as e:
+    logger.error(f"Error AWS: {e.response['Error']['Message']}")
 except Exception as e:
-    logger.error(f"Error inicializando cliente SiteWise: {str(e)}")
-    sitewise = None
+    logger.error(f"Error inicializando SiteWise: {str(e)}")
+
+@mcp.tool()
+def health_check() -> Dict[str, Any]:
+    """
+    Verifica el estado del servidor y la conexión a AWS SiteWise.
+    
+    Returns:
+        Dict con el estado del servidor y servicios
+    """
+    result = {
+        "server": "sitewise-mcp-server",
+        "version": "1.0.1",
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "services": {}
+    }
+    
+    if sitewise:
+        try:
+            response = sitewise.list_asset_models(maxResults=1)
+            result["services"]["sitewise"] = {
+                "status": "connected",
+                "region": boto3.Session().region_name or "default"
+            }
+        except Exception as e:
+            result["services"]["sitewise"] = {
+                "status": "error",
+                "error": str(e)
+            }
+    else:
+        result["services"]["sitewise"] = {
+            "status": "not_initialized",
+            "error": "Cliente no disponible - verificar credenciales AWS"
+        }
+    
+    return result
 
 @mcp.tool()
 def list_all_assets_hierarchy() -> Dict[str, Any]:
     """
-    Obtiene TODOS los activos organizados en jerarquía: principales → hijos → nietos.
+    Obtiene todos los activos organizados en jerarquía: principales → hijos → nietos.
     
     Returns:
         Dict con todos los activos organizados por niveles jerárquicos
     """
     if not sitewise:
-        raise Exception("Cliente SiteWise no disponible")
+        return {
+            "success": False,
+            "error": "Cliente SiteWise no disponible. Verificar credenciales AWS."
+        }
     
     try:
         all_assets = []
+        models_count = 0
         
-        # Obtener modelos
-        models_response = sitewise.list_asset_models(maxResults=50)
-        models = models_response.get('assetModelSummaries', [])
+        # Obtener modelos con paginación
+        paginator = sitewise.get_paginator('list_asset_models')
+        for page in paginator.paginate(maxResults=50):
+            models = page.get('assetModelSummaries', [])
+            models_count += len(models)
+            
+            for model in models:
+                try:
+                    asset_paginator = sitewise.get_paginator('list_assets')
+                    for asset_page in asset_paginator.paginate(
+                        assetModelId=model['id'],
+                        maxResults=100
+                    ):
+                        for asset in asset_page.get('assetSummaries', []):
+                            asset_info = {
+                                "id": asset['id'],
+                                "name": asset['name'],
+                                "model_name": model['name'],
+                                "model_id": model['id'],
+                                "parent_id": asset.get('parentAssetId'),
+                                "level": 0,
+                                "arn": asset.get('arn', ''),
+                                "creation_date": asset.get('creationDate', '').isoformat() if asset.get('creationDate') else '',
+                                "last_update": asset.get('lastUpdateDate', '').isoformat() if asset.get('lastUpdateDate') else ''
+                            }
+                            all_assets.append(asset_info)
+                            
+                except Exception as e:
+                    logger.warning(f"Error con modelo {model['id']}: {e}")
+                    continue
         
-        for model in models:
-            try:
-                # Obtener todos los activos de este modelo
-                assets_response = sitewise.list_assets(
-                    assetModelId=model['id'],
-                    maxResults=100
-                )
-                
-                for asset in assets_response.get('assetSummaries', []):
-                    asset_info = {
-                        "id": asset['id'],
-                        "name": asset['name'],
-                        "model_name": model['name'],
-                        "parent_id": asset.get('parentAssetId'),
-                        "level": 0,  # Se calculará después
-                        "arn": asset.get('arn', ''),
-                        "creation_date": asset.get('creationDate', ''),
-                        "last_update": asset.get('lastUpdateDate', '')
-                    }
-                    all_assets.append(asset_info)
-                    
-            except Exception as e:
-                logger.warning(f"Error con modelo {model['id']}: {e}")
-                continue
+        if not all_assets:
+            return {
+                "success": True,
+                "assets": [],
+                "total_count": 0,
+                "message": f"No se encontraron activos en {models_count} modelos"
+            }
         
         # Organizar por jerarquía
-        # 1. Identificar activos principales (sin padre)
         main_assets = [a for a in all_assets if not a['parent_id']]
         
-        # 2. Calcular niveles y organizar hijos
         def calculate_levels(asset_list, level=0):
             for asset in asset_list:
                 asset['level'] = level
-                # Encontrar hijos directos
                 children = [a for a in all_assets if a['parent_id'] == asset['id']]
                 asset['children'] = children
                 asset['children_count'] = len(children)
                 
-                # Calcular niveles de hijos recursivamente
                 if children:
                     calculate_levels(children, level + 1)
         
-        # Aplicar cálculo de niveles
         calculate_levels(main_assets)
         
         # Crear lista plana ordenada por jerarquía
         def flatten_with_hierarchy(assets_list, flat_list):
             for asset in assets_list:
-                # Añadir activo actual
                 flat_list.append({
                     "id": asset['id'],
                     "name": asset['name'],
                     "model_name": asset['model_name'],
+                    "model_id": asset['model_id'],
                     "level": asset['level'],
                     "parent_id": asset['parent_id'],
                     "children_count": asset['children_count'],
@@ -104,11 +169,9 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
                     "last_update": asset['last_update']
                 })
                 
-                # Añadir hijos recursivamente
                 if asset.get('children'):
                     flatten_with_hierarchy(asset['children'], flat_list)
         
-        # Generar lista final
         hierarchical_list = []
         flatten_with_hierarchy(main_assets, hierarchical_list)
         
@@ -117,13 +180,21 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
             "assets": hierarchical_list,
             "total_count": len(hierarchical_list),
             "main_assets_count": len(main_assets),
+            "models_count": models_count,
             "max_level": max([a['level'] for a in hierarchical_list]) if hierarchical_list else 0,
-            "message": f"Jerarquía completa: {len(hierarchical_list)} activos organizados en {max([a['level'] for a in hierarchical_list]) + 1 if hierarchical_list else 0} niveles"
+            "message": f"Jerarquía completa: {len(hierarchical_list)} activos en {max([a['level'] for a in hierarchical_list]) + 1 if hierarchical_list else 0} niveles"
         }
         
+    except ClientError as e:
+        return {
+            "success": False,
+            "error": f"Error AWS: {e.response['Error']['Message']}"
+        }
     except Exception as e:
-        raise Exception(f"Error obteniendo jerarquía completa: {str(e)}")
-
+        return {
+            "success": False,
+            "error": f"Error obteniendo jerarquía: {str(e)}"
+        }
 
 @mcp.tool()
 def get_asset_properties(asset_id: str) -> Dict[str, Any]:
@@ -137,7 +208,10 @@ def get_asset_properties(asset_id: str) -> Dict[str, Any]:
         Dict con las propiedades del activo
     """
     if not sitewise:
-        raise Exception("Cliente SiteWise no disponible")
+        return {
+            "success": False,
+            "error": "Cliente SiteWise no disponible"
+        }
     
     try:
         response = sitewise.describe_asset(assetId=asset_id)
@@ -160,17 +234,26 @@ def get_asset_properties(asset_id: str) -> Dict[str, Any]:
             "success": True,
             "asset_id": asset_id,
             "asset_name": response.get('assetName'),
+            "asset_model_id": response.get('assetModelId'),
             "properties": formatted_properties,
             "count": len(formatted_properties)
         }
         
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceNotFoundException':
-            raise Exception(f"Activo {asset_id} no encontrado")
-        raise Exception(f"Error AWS: {e.response['Error']['Message']}")
+            return {
+                "success": False,
+                "error": f"Activo {asset_id} no encontrado"
+            }
+        return {
+            "success": False,
+            "error": f"Error AWS: {e.response['Error']['Message']}"
+        }
     except Exception as e:
-        raise Exception(f"Error obteniendo propiedades: {str(e)}")
-
+        return {
+            "success": False,
+            "error": f"Error obteniendo propiedades: {str(e)}"
+        }
 
 @mcp.tool()
 def get_current_value(
@@ -190,7 +273,10 @@ def get_current_value(
         Dict con el valor actual de la propiedad
     """
     if not sitewise:
-        raise Exception("Cliente SiteWise no disponible")
+        return {
+            "success": False,
+            "error": "Cliente SiteWise no disponible"
+        }
     
     try:
         params = {}
@@ -201,7 +287,10 @@ def get_current_value(
             params['assetId'] = asset_id
             params['propertyId'] = property_id
         else:
-            raise Exception("Debe proporcionar property_alias O (asset_id + property_id)")
+            return {
+                "success": False,
+                "error": "Debe proporcionar property_alias O (asset_id + property_id)"
+            }
         
         response = sitewise.get_asset_property_value(**params)
         property_value = response.get('propertyValue', {})
@@ -219,11 +308,19 @@ def get_current_value(
         
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceNotFoundException':
-            raise Exception("Propiedad no encontrada o sin datos")
-        raise Exception(f"Error AWS: {e.response['Error']['Message']}")
+            return {
+                "success": False,
+                "error": "Propiedad no encontrada o sin datos"
+            }
+        return {
+            "success": False,
+            "error": f"Error AWS: {e.response['Error']['Message']}"
+        }
     except Exception as e:
-        raise Exception(f"Error obteniendo valor actual: {str(e)}")
-
+        return {
+            "success": False,
+            "error": f"Error obteniendo valor actual: {str(e)}"
+        }
 
 @mcp.tool()
 def get_historical_data(
@@ -249,17 +346,19 @@ def get_historical_data(
         Dict con los valores históricos de la propiedad
     """
     if not sitewise:
-        raise Exception("Cliente SiteWise no disponible")
+        return {
+            "success": False,
+            "error": "Cliente SiteWise no disponible"
+        }
     
     try:
-        # Convertir fechas ISO a timestamp Unix (segundos)
         start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
         end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
         
         params = {
             'startDate': int(start_dt.timestamp()),
             'endDate': int(end_dt.timestamp()),
-            'maxResults': max_results,
+            'maxResults': min(max_results, 20000),
             'timeOrdering': 'ASCENDING'
         }
         
@@ -269,7 +368,10 @@ def get_historical_data(
             params['assetId'] = asset_id
             params['propertyId'] = property_id
         else:
-            raise Exception("Debe proporcionar property_alias O (asset_id + property_id)")
+            return {
+                "success": False,
+                "error": "Debe proporcionar property_alias O (asset_id + property_id)"
+            }
         
         response = sitewise.get_asset_property_value_history(**params)
         values = response.get('assetPropertyValueHistory', [])
@@ -296,12 +398,20 @@ def get_historical_data(
         }
         
     except ValueError as e:
-        raise Exception(f"Formato de fecha inválido: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Formato de fecha inválido: {str(e)}"
+        }
     except ClientError as e:
-        raise Exception(f"Error AWS: {e.response['Error']['Message']}")
+        return {
+            "success": False,
+            "error": f"Error AWS: {e.response['Error']['Message']}"
+        }
     except Exception as e:
-        raise Exception(f"Error obteniendo historial: {str(e)}")
-
+        return {
+            "success": False,
+            "error": f"Error obteniendo historial: {str(e)}"
+        }
 
 @mcp.tool()
 def get_latest_values(
@@ -323,18 +433,20 @@ def get_latest_values(
         Dict con los últimos valores de la propiedad
     """
     if not sitewise:
-        raise Exception("Cliente SiteWise no disponible")
+        return {
+            "success": False,
+            "error": "Cliente SiteWise no disponible"
+        }
     
     try:
-        # Usar últimas 24 horas por defecto (timestamps Unix)
         end_date = datetime.now()
         start_date = end_date - timedelta(days=1)
         
         params = {
             'startDate': int(start_date.timestamp()),
             'endDate': int(end_date.timestamp()),
-            'maxResults': count,
-            'timeOrdering': 'DESCENDING'  # Más recientes primero
+            'maxResults': min(count, 20000),
+            'timeOrdering': 'DESCENDING'
         }
         
         if property_alias:
@@ -343,7 +455,10 @@ def get_latest_values(
             params['assetId'] = asset_id
             params['propertyId'] = property_id
         else:
-            raise Exception("Debe proporcionar property_alias O (asset_id + property_id)")
+            return {
+                "success": False,
+                "error": "Debe proporcionar property_alias O (asset_id + property_id)"
+            }
         
         response = sitewise.get_asset_property_value_history(**params)
         values = response.get('assetPropertyValueHistory', [])
@@ -362,25 +477,35 @@ def get_latest_values(
             "asset_id": asset_id,
             "property_id": property_id,
             "requested_count": count,
-            "count": len(formatted_values),
             "actual_count": len(formatted_values),
             "values": formatted_values,
             "time_range": f"{start_date.isoformat()} to {end_date.isoformat()}"
         }
         
     except ClientError as e:
-        raise Exception(f"Error AWS: {e.response['Error']['Message']}")
+        return {
+            "success": False,
+            "error": f"Error AWS: {e.response['Error']['Message']}"
+        }
     except Exception as e:
-        raise Exception(f"Error obteniendo últimos valores: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Error obteniendo últimos valores: {str(e)}"
+        }
 
-
-# Función principal simple que funciona con FastMCP
+# Función principal sin logs a stdout
 if __name__ == '__main__':
     try:
-        logger.info("Iniciando servidor MCP SiteWise...")
+        logger.info("Iniciando servidor MCP SiteWise")
+        if sitewise:
+            logger.info("Servidor listo para conexiones MCP")
+        else:
+            logger.warning("Servidor sin conexión SiteWise")
+        
+        # Solo ejecutar MCP, sin otros prints
         mcp.run()
     except KeyboardInterrupt:
-        logger.info("Servidor detenido por el usuario")
+        logger.info("Servidor detenido por usuario")
     except Exception as e:
         logger.error(f"Error ejecutando servidor: {e}")
         sys.exit(1)

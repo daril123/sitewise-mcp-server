@@ -4,62 +4,41 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// Colores para la consola (compatible con Windows)
-const colors = {
-  reset: '\x1b[0m',
-  bright: '\x1b[1m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
-  cyan: '\x1b[36m',
-  white: '\x1b[37m'
-};
-
-// Detectar si los colores son soportados
-const supportsColor = process.platform !== 'win32' || process.env.FORCE_COLOR || process.env.CI;
-
-function log(message, color = 'reset') {
-  if (supportsColor) {
-    console.log(`${colors[color]}${message}${colors.reset}`);
-  } else {
-    console.log(message);
-  }
+// CRÍTICO: Solo logs a stderr, nunca a stdout (MCP requirement)
+function log(message) {
+  console.error(`[sitewise-mcp] ${message}`);
 }
 
 function checkPython() {
   return new Promise((resolve, reject) => {
-    const python = spawn('python3', ['--version']);
+    const python = spawn('python3', ['--version'], { stdio: ['pipe', 'pipe', 'pipe'] });
     
     python.on('close', (code) => {
       if (code === 0) {
         resolve('python3');
       } else {
-        // Intenta con python
-        const pythonAlt = spawn('python', ['--version']);
+        const pythonAlt = spawn('python', ['--version'], { stdio: ['pipe', 'pipe', 'pipe'] });
         pythonAlt.on('close', (altCode) => {
           if (altCode === 0) {
             resolve('python');
           } else {
-            reject(new Error('Python no está instalado o no está en el PATH'));
+            reject(new Error('Python no encontrado'));
           }
         });
       }
     });
     
     python.on('error', () => {
-      // Intenta con python
-      const pythonAlt = spawn('python', ['--version']);
+      const pythonAlt = spawn('python', ['--version'], { stdio: ['pipe', 'pipe', 'pipe'] });
       pythonAlt.on('close', (altCode) => {
         if (altCode === 0) {
           resolve('python');
         } else {
-          reject(new Error('Python no está instalado o no está en el PATH'));
+          reject(new Error('Python no encontrado'));
         }
       });
       pythonAlt.on('error', () => {
-        reject(new Error('Python no está instalado o no está en el PATH'));
+        reject(new Error('Python no encontrado'));
       });
     });
   });
@@ -67,68 +46,65 @@ function checkPython() {
 
 function installDependencies(pythonCmd, srcDir) {
   return new Promise((resolve, reject) => {
-    log('📦 Instalando dependencias de Python...', 'yellow');
-    
     const requirementsPath = path.join(srcDir, 'requirements.txt');
     
     if (!fs.existsSync(requirementsPath)) {
-      reject(new Error(`No se encontró requirements.txt en ${requirementsPath}`));
+      reject(new Error(`requirements.txt no encontrado en ${requirementsPath}`));
       return;
     }
     
+    log('Instalando dependencias...');
     const pip = spawn(pythonCmd, ['-m', 'pip', 'install', '-r', requirementsPath], {
-      stdio: 'inherit'
+      stdio: ['pipe', 'pipe', 'inherit'] // Solo stderr visible
     });
     
     pip.on('close', (code) => {
       if (code === 0) {
-        log('✅ Dependencias instaladas correctamente', 'green');
         resolve();
       } else {
-        reject(new Error(`Error instalando dependencias (código: ${code})`));
+        reject(new Error(`Error instalando dependencias: ${code}`));
       }
     });
     
     pip.on('error', (err) => {
-      reject(new Error(`Error ejecutando pip: ${err.message}`));
+      reject(new Error(`Error pip: ${err.message}`));
     });
   });
 }
 
-function runServer(pythonCmd, serverPath, args) {
+function runServer(pythonCmd, serverPath) {
   return new Promise((resolve, reject) => {
-    log('🚀 Iniciando SiteWise MCP Server...', 'green');
+    log('Iniciando servidor...');
     
-    const server = spawn(pythonCmd, [serverPath, ...args], {
-      stdio: ['pipe', 'pipe', 'pipe'], // stdio para MCP compatibilidad
+    // CRÍTICO: stdio: 'inherit' para que MCP funcione correctamente
+    const server = spawn(pythonCmd, [serverPath], {
+      stdio: 'inherit',
       env: {
         ...process.env,
-        // Cargar variables de entorno desde .env si existe
-        ...loadEnvFile()
+        ...loadEnvFile(),
+        // Forzar que Python use stderr para logs
+        PYTHONUNBUFFERED: '1'
       }
     });
     
     server.on('close', (code) => {
       if (code === 0) {
-        log('✅ Servidor cerrado correctamente', 'green');
         resolve();
       } else {
-        reject(new Error(`Servidor cerrado con código: ${code}`));
+        reject(new Error(`Servidor terminado: ${code}`));
       }
     });
     
     server.on('error', (err) => {
-      reject(new Error(`Error ejecutando servidor: ${err.message}`));
+      reject(new Error(`Error servidor: ${err.message}`));
     });
     
-    // Manejo de señales para cerrar gracefully
+    // Manejo de señales
     process.on('SIGINT', () => {
-      log('\n🛑 Cerrando servidor...', 'yellow');
       server.kill('SIGINT');
     });
     
     process.on('SIGTERM', () => {
-      log('\n🛑 Cerrando servidor...', 'yellow');
       server.kill('SIGTERM');
     });
   });
@@ -139,14 +115,17 @@ function loadEnvFile() {
   const env = {};
   
   if (fs.existsSync(envPath)) {
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    envContent.split('\n').forEach(line => {
-      const [key, value] = line.split('=');
-      if (key && value) {
-        env[key.trim()] = value.trim();
-      }
-    });
-    log('📋 Variables de entorno cargadas desde .env', 'blue');
+    try {
+      const envContent = fs.readFileSync(envPath, 'utf8');
+      envContent.split('\n').forEach(line => {
+        const [key, value] = line.split('=');
+        if (key && value) {
+          env[key.trim()] = value.trim().replace(/^["']|["']$/g, '');
+        }
+      });
+    } catch (err) {
+      log(`Error leyendo .env: ${err.message}`);
+    }
   }
   
   return env;
@@ -154,28 +133,21 @@ function loadEnvFile() {
 
 async function main() {
   try {
-    log('🔧 SiteWise MCP Server', 'cyan');
-    log('========================', 'cyan');
-    
-    // Determinar rutas
+    // Rutas
     const packageDir = path.dirname(__dirname);
     const srcDir = path.join(packageDir, 'src');
     const serverPath = path.join(srcDir, 'server.py');
     
-    // Verificar que el archivo del servidor existe
     if (!fs.existsSync(serverPath)) {
-      throw new Error(`No se encontró server.py en ${serverPath}`);
+      throw new Error(`server.py no encontrado en ${serverPath}`);
     }
     
-    // Verificar Python
-    log('🐍 Verificando Python...', 'blue');
+    // Verificar Python (silencioso)
     const pythonCmd = await checkPython();
-    log(`✅ Python encontrado: ${pythonCmd}`, 'green');
     
-    // Verificar argumentos
+    // Argumentos
     const args = process.argv.slice(2);
     const shouldInstall = args.includes('--install') || args.includes('-i');
-    const filteredArgs = args.filter(arg => !['--install', '-i'].includes(arg));
     
     // Instalar dependencias si se solicita
     if (shouldInstall) {
@@ -183,35 +155,19 @@ async function main() {
     }
     
     // Ejecutar servidor
-    await runServer(pythonCmd, serverPath, filteredArgs);
+    await runServer(pythonCmd, serverPath);
     
   } catch (error) {
-    log(`❌ Error: ${error.message}`, 'red');
+    log(`ERROR: ${error.message}`);
     process.exit(1);
   }
 }
 
-// Mostrar ayuda
+// Help
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
-  log('🔧 SiteWise MCP Server', 'cyan');
-  log('========================', 'cyan');
-  log('');
-  log('Uso:', 'bright');
-  log('  npx sitewise-mcp-server [opciones]');
-  log('');
-  log('Opciones:', 'bright');
-  log('  -h, --help     Mostrar esta ayuda');
-  log('  -i, --install  Instalar dependencias de Python antes de ejecutar');
-  log('');
-  log('Ejemplos:', 'bright');
-  log('  npx sitewise-mcp-server --install');
-  log('  npx sitewise-mcp-server');
-  log('');
-  log('Configuración:', 'bright');
-  log('  Crea un archivo .env en el directorio actual con:');
-  log('    AWS_PROFILE=default');
-  log('    AWS_REGION=us-east-1');
-  log('    LOG_LEVEL=DEBUG');
+  console.error('SiteWise MCP Server');
+  console.error('Uso: npx sitewise-mcp-server [--install]');
+  console.error('  --install: Instalar dependencias Python');
   process.exit(0);
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "sitewise-mcp-server",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "MCP Server for AWS IoT SiteWise integration",
   "main": "index.js",
   "bin": {
@@ -9,14 +9,16 @@
   "scripts": {
     "start": "node bin/sitewise-mcp-server.js",
     "install-deps": "pip install -r src/requirements.txt",
-    "setup": "npm run install-deps"
+    "setup": "npm run install-deps",
+    "test": "node bin/sitewise-mcp-server.js --help"
   },
   "keywords": [
     "mcp",
     "aws",
     "iot-sitewise",
     "server",
-    "model-context-protocol"
+    "model-context-protocol",
+    "claude"
   ],
   "author": "Your Name",
   "license": "MIT",
