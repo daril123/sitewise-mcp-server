@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SiteWise MCP Server with FastMCP
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        MCP_SERVER_NAME: sitewise-mcp-server
+        MCP_SERVER_VERSION: 1.0.0
+
+Resources:
+  # Rol IAM para la función Lambda
+  SiteWiseMCPRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SiteWiseReadOnlyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iotsitewise:ListAssets
+                  - iotsitewise:ListAssetModels
+                  - iotsitewise:DescribeAsset
+                  - iotsitewise:DescribeAssetModel
+                  - iotsitewise:GetAssetPropertyValue
+                  - iotsitewise:GetAssetPropertyValueHistory
+                  - iotsitewise:GetAssetPropertyAggregates
+                  - iotsitewise:BatchGetAssetPropertyValue
+                  - iotsitewise:BatchGetAssetPropertyValueHistory
+                  - iotsitewise:BatchGetAssetPropertyAggregates
+                  - iotsitewise:ListAssetProperties
+                Resource: "*"
+
+  # Función Lambda
+  SiteWiseMCPFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitewise-mcp-server-${Environment}'
+      PackageType: Image
+      ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sitewise-mcp:latest'
+      Role: !GetAtt SiteWiseMCPRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowCredentials: false
+          AllowHeaders:
+            - content-type
+            - authorization
+          AllowMethods:
+            - GET
+            - POST
+            - OPTIONS
+          AllowOrigins:
+            - "*"
+          MaxAge: 3600
+        InvokeMode: RESPONSE_STREAM
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+Outputs:
+  SiteWiseMCPApi:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+    
+  SiteWiseMCPFunctionUrl:
+    Description: "Lambda Function URL"
+    Value: !GetAtt SiteWiseMCPFunctionUrl.FunctionUrl
+    
+  SiteWiseMCPFunction:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt SiteWiseMCPFunction.Arn
