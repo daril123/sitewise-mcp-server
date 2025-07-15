@@ -1,7 +1,7 @@
 # Development files
 .env
 .env.*
-!.env.example
+.env.example
 
 # Source control
 .git/

@@ -80,50 +80,8 @@ except ClientError as e:
 except Exception as e:
     logger.error(f"❌ Error inicializando SiteWise: {str(e)}")
 
-@mcp.tool()
-def health_check() -> Dict[str, Any]:
-    """
-    Verifica el estado del servidor y la conexión a AWS SiteWise.
-    
-    Returns:
-        Dict con el estado del servidor y servicios
-    """
-    result = {
-        "server": "sitewise-mcp-server",
-        "version": "1.0.5",
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "services": {},
-        "aws_config": {
-            "region": os.getenv('AWS_REGION', 'us-east-1'),
-            "using_env_credentials": bool(os.getenv('AWS_ACCESS_KEY_ID')),
-            "profile": os.getenv('AWS_PROFILE', 'default')
-        }
-    }
-    
-    if sitewise:
-        try:
-            # Test simple con SiteWise
-            response = sitewise.list_asset_models(maxResults=1)
-            result["services"]["sitewise"] = {
-                "status": "connected",
-                "region": boto3.Session().region_name or os.getenv('AWS_REGION', 'default'),
-                "test_response": "✅ Conexión exitosa"
-            }
-        except Exception as e:
-            result["services"]["sitewise"] = {
-                "status": "error",
-                "error": str(e),
-                "suggestion": "Verifica permisos IoT SiteWise en tu cuenta AWS"
-            }
-    else:
-        result["services"]["sitewise"] = {
-            "status": "not_initialized",
-            "error": "Cliente no disponible",
-            "suggestion": "Configura AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY en .env"
-        }
-    
-    return result
+
+
 
 @mcp.tool()
 def list_all_assets_hierarchy() -> Dict[str, Any]:
@@ -141,15 +99,21 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
     
     try:
         all_assets = []
-        models_count = 0
+        models_info = {}
         
-        # Obtener modelos con paginación
+        # Obtener todos los activos
+        logger.info("Obteniendo todos los activos...")
         paginator = sitewise.get_paginator('list_asset_models')
         for page in paginator.paginate(maxResults=50):
             models = page.get('assetModelSummaries', [])
-            models_count += len(models)
             
             for model in models:
+                models_info[model['id']] = {
+                    "name": model['name'],
+                    "description": model.get('description', ''),
+                    "creation_date": model.get('creationDate', '').isoformat() if model.get('creationDate') else ''
+                }
+                
                 try:
                     asset_paginator = sitewise.get_paginator('list_assets')
                     for asset_page in asset_paginator.paginate(
@@ -162,11 +126,13 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
                                 "name": asset['name'],
                                 "model_name": model['name'],
                                 "model_id": model['id'],
-                                "parent_id": asset.get('parentAssetId'),
-                                "level": 0,
                                 "arn": asset.get('arn', ''),
                                 "creation_date": asset.get('creationDate', '').isoformat() if asset.get('creationDate') else '',
-                                "last_update": asset.get('lastUpdateDate', '').isoformat() if asset.get('lastUpdateDate') else ''
+                                "last_update": asset.get('lastUpdateDate', '').isoformat() if asset.get('lastUpdateDate') else '',
+                                "status": asset.get('status', {}).get('state', 'UNKNOWN'),
+                                "children": [],
+                                "parent_id": None,
+                                "properties": []
                             }
                             all_assets.append(asset_info)
                             
@@ -177,56 +143,103 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
         if not all_assets:
             return {
                 "success": True,
-                "assets": [],
-                "total_count": 0,
-                "message": f"No se encontraron activos en {models_count} modelos"
+                "structured_data": [],
+                "message": "No se encontraron activos"
             }
         
-        # Organizar por jerarquía
-        main_assets = [a for a in all_assets if not a['parent_id']]
+        # Obtener asociaciones y propiedades para cada activo
+        assets_dict = {asset['id']: asset for asset in all_assets}
         
-        def calculate_levels(asset_list, level=0):
-            for asset in asset_list:
-                asset['level'] = level
-                children = [a for a in all_assets if a['parent_id'] == asset['id']]
-                asset['children'] = children
-                asset['children_count'] = len(children)
+        for asset in all_assets:
+            try:
+                # Obtener hijos
+                children_response = sitewise.list_associated_assets(
+                    assetId=asset['id'],
+                    traversalDirection='CHILD'
+                )
                 
-                if children:
-                    calculate_levels(children, level + 1)
-        
-        calculate_levels(main_assets)
-        
-        # Crear lista plana ordenada por jerarquía
-        def flatten_with_hierarchy(assets_list, flat_list):
-            for asset in assets_list:
-                flat_list.append({
-                    "id": asset['id'],
-                    "name": asset['name'],
-                    "model_name": asset['model_name'],
-                    "model_id": asset['model_id'],
-                    "level": asset['level'],
-                    "parent_id": asset['parent_id'],
-                    "children_count": asset['children_count'],
-                    "arn": asset['arn'],
-                    "creation_date": asset['creation_date'],
-                    "last_update": asset['last_update']
-                })
+                for child_summary in children_response.get('assetSummaries', []):
+                    child_id = child_summary['id']
+                    if child_id in assets_dict:
+                        child_asset = assets_dict[child_id]
+                        child_asset['parent_id'] = asset['id']
+                        asset['children'].append({
+                            "id": child_id,
+                            "name": child_summary['name'],
+                            "model_name": assets_dict[child_id]['model_name']
+                        })
                 
-                if asset.get('children'):
-                    flatten_with_hierarchy(asset['children'], flat_list)
+                # Obtener propiedades básicas
+                try:
+                    asset_details = sitewise.describe_asset(assetId=asset['id'])
+                    properties = asset_details.get('assetProperties', [])
+                    
+                    for prop in properties:
+                        asset['properties'].append({
+                            "id": prop.get('id'),
+                            "name": prop.get('name'),
+                            "alias": prop.get('alias'),
+                            "dataType": prop.get('dataType'),
+                            "unit": prop.get('unit'),
+                            "dataTypeSpec": prop.get('dataTypeSpec')
+                        })
+                except Exception as e:
+                    logger.warning(f"Error obteniendo propiedades para {asset['id']}: {e}")
+                
+            except Exception as e:
+                logger.warning(f"Error obteniendo asociaciones para {asset['id']}: {e}")
+                continue
         
-        hierarchical_list = []
-        flatten_with_hierarchy(main_assets, hierarchical_list)
+        # Identificar activos raíz (sin padres)
+        root_assets = [asset for asset in all_assets if asset['parent_id'] is None]
+        
+        # Crear estructura jerarquizada
+        def build_hierarchy_structure(asset_id, level=0):
+            asset = assets_dict[asset_id]
+            
+            structure = {
+                "id": asset['id'],
+                "name": asset['name'],
+                "model_name": asset['model_name'],
+                "model_id": asset['model_id'],
+                "level": level,
+                "status": asset['status'],
+                "creation_date": asset['creation_date'],
+                "last_update": asset['last_update'],
+                "arn": asset['arn'],
+                "properties_count": len(asset['properties']),
+                "properties": [
+                    {
+                        "id": prop['id'],
+                        "name": prop['name'],
+                        "alias": prop['alias'],
+                        "dataType": prop['dataType'],
+                        "unit": prop['unit'],
+                        "dataTypeSpec": prop['dataTypeSpec']
+                    } for prop in asset['properties']
+                ],
+                "children_names": [child['name'] for child in asset['children']],
+                "children_count": len(asset['children']),
+                "children": []
+            }
+            
+            # Procesar hijos recursivamente
+            for child in asset['children']:
+                structure['children'].append(build_hierarchy_structure(child['id'], level + 1))
+            
+            return structure
+        
+        # Construir jerarquía completa
+        hierarchy_structure = []
+        for root in root_assets:
+            if root['children']:  # Solo incluir raíces que tengan hijos
+                hierarchy_structure.append(build_hierarchy_structure(root['id']))
         
         return {
             "success": True,
-            "assets": hierarchical_list,
-            "total_count": len(hierarchical_list),
-            "main_assets_count": len(main_assets),
-            "models_count": models_count,
-            "max_level": max([a['level'] for a in hierarchical_list]) if hierarchical_list else 0,
-            "message": f"Jerarquía completa: {len(hierarchical_list)} activos en {max([a['level'] for a in hierarchical_list]) + 1 if hierarchical_list else 0} niveles"
+            "structured_data": hierarchy_structure,
+            "models_info": models_info,
+            "message": f"Jerarquía obtenida: {len(all_assets)} activos, {len(hierarchy_structure)} jerarquías principales"
         }
         
     except ClientError as e:
@@ -237,7 +250,7 @@ def list_all_assets_hierarchy() -> Dict[str, Any]:
     except Exception as e:
         return {
             "success": False,
-            "error": f"Error obteniendo jerarquía: {str(e)}"
+            "error": f"Error obteniendo jerarquía formateada: {str(e)}"
         }
 
 @mcp.tool()

@@ -6,7 +6,7 @@
 .env.production
 .env.staging
 .env.*
-!.env.example
+
 
 # AWS Credentials and Config
 .aws/

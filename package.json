@@ -1,16 +1,16 @@
 {
-  "name": "sitewise-mcp-server",
-  "version": "1.0.6",
+  "name": "sitewise-mcp-server-pks",
+  "version": "1.0.2",
   "description": "MCP Server for AWS IoT SiteWise integration with support for direct AWS credentials",
   "main": "index.js",
   "bin": {
-    "sitewise-mcp-server": "./bin/sitewise-mcp-server.js"
+    "sitewise-mcp-server-pks": "./bin/sitewise-mcp-server-pks.js"
   },
   "scripts": {
-    "start": "node bin/sitewise-mcp-server.js",
+    "start": "node bin/sitewise-mcp-server-pks.js",
     "install-deps": "pip install -r src/requirements.txt",
     "setup": "npm run install-deps",
-    "test": "node bin/sitewise-mcp-server.js --help"
+    "test": "node bin/sitewise-mcp-server-pks.js --help"
   },
   "keywords": [
     "mcp",
@@ -27,7 +27,9 @@
   "engines": {
     "node": ">=16.0.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@fredsander1234/dynamodb-mcp-server-pks": "^1.0.1"
+  },
   "os": [
     "darwin",
     "linux",
